@@ -7822,5 +7822,535 @@ renderDrawer();
 updateHamburger();
 initOrgCarousel();
 </script>
+
+<!-- ═══════════════════════════════════════════════════════
+     GOOGLE DRIVE SYNC — Module finances
+     Client ID : 674783082124-qllkg36817ekme3q2a810u9n4v35qcne.apps.googleusercontent.com
+     Fichier Drive : budget-2026.json
+═══════════════════════════════════════════════════════ -->
+<script src="https://accounts.google.com/gsi/client" async></script>
+<script>
+// ── CONFIG ─────────────────────────────────────────────
+const GOOG_CLIENT_ID = '674783082124-qllkg36817ekme3q2a810u9n4v35qcne.apps.googleusercontent.com';
+const DRIVE_FILE_NAME = 'budget-2026.json';
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+
+// ── STATE DRIVE ────────────────────────────────────────
+let gToken = null;
+let driveFileId = null;
+let syncPending = false;
+let syncTimeout = null;
+let tokenClient = null;
+
+// ── INIT AUTH ──────────────────────────────────────────
+function initGoogleAuth() {
+  if (typeof google === 'undefined') { setTimeout(initGoogleAuth, 500); return; }
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOG_CLIENT_ID,
+    scope: DRIVE_SCOPE,
+    callback: async (resp) => {
+      if (resp.error) { showToast('❌ Connexion Google échouée'); return; }
+      gToken = resp.access_token;
+      showToast('✅ Connecté à Google Drive');
+      updateSyncUI(true);
+      await findOrCreateDriveFile();
+      await pullFromDrive();
+    }
+  });
+}
+
+function connectGoogle() {
+  if (!tokenClient) { showToast('Chargement…'); setTimeout(connectGoogle, 500); return; }
+  tokenClient.requestAccessToken({ prompt: 'consent' });
+}
+
+function disconnectGoogle() {
+  gToken = null; driveFileId = null;
+  updateSyncUI(false);
+  showToast('Déconnecté de Google Drive');
+}
+
+function updateSyncUI(connected) {
+  const btnCo = document.getElementById('gdriveBtnConnect');
+  const btnDi = document.getElementById('gdriveBtnDisconnect');
+  const status = document.getElementById('gdriveStatus');
+  if (btnCo) btnCo.style.display = connected ? 'none' : 'flex';
+  if (btnDi) btnDi.style.display = connected ? 'flex' : 'none';
+  if (status) status.textContent = connected ? '🟢 Connecté · Drive' : '⚫ Non connecté';
+}
+
+// ── FIND OR CREATE FILE ────────────────────────────────
+async function findOrCreateDriveFile() {
+  if (!gToken) return;
+  // Search for existing file
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=name='${DRIVE_FILE_NAME}' and trashed=false&fields=files(id,name)`,
+    { headers: { Authorization: 'Bearer ' + gToken } }
+  );
+  const data = await res.json();
+  if (data.files && data.files.length > 0) {
+    driveFileId = data.files[0].id;
+    return;
+  }
+  // Create new file
+  const meta = { name: DRIVE_FILE_NAME, mimeType: 'application/json' };
+  const initial = JSON.stringify({ transactions: [], projection: [], lastSync: null }, null, 2);
+  const form = new FormData();
+  form.append('metadata', new Blob([JSON.stringify(meta)], { type: 'application/json' }));
+  form.append('file', new Blob([initial], { type: 'application/json' }));
+  const create = await fetch(
+    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',
+    { method: 'POST', headers: { Authorization: 'Bearer ' + gToken }, body: form }
+  );
+  const created = await create.json();
+  driveFileId = created.id;
+  showToast('📁 Fichier budget-2026.json créé sur Drive');
+}
+
+// ── PUSH TO DRIVE ──────────────────────────────────────
+async function pushToDrive(showMsg = false) {
+  if (!gToken || !driveFileId) return;
+  const payload = {
+    transactions: STATE.finances.budget.transactions || [],
+    projection: STATE.finances.budget.projection || [],
+    lastSync: new Date().toISOString()
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const form = new FormData();
+  form.append('metadata', new Blob([JSON.stringify({ name: DRIVE_FILE_NAME })], { type: 'application/json' }));
+  form.append('file', blob);
+  await fetch(
+    `https://www.googleapis.com/upload/drive/v3/files/${driveFileId}?uploadType=multipart`,
+    { method: 'PATCH', headers: { Authorization: 'Bearer ' + gToken }, body: form }
+  );
+  const ts = document.getElementById('gdriveLastSync');
+  if (ts) ts.textContent = 'Sync ' + new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+  if (showMsg) showToast('✅ Synchronisé avec Drive');
+}
+
+// ── PULL FROM DRIVE ────────────────────────────────────
+async function pullFromDrive() {
+  if (!gToken || !driveFileId) return;
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`,
+    { headers: { Authorization: 'Bearer ' + gToken } }
+  );
+  const data = await res.json();
+  if (data.transactions) {
+    STATE.finances.budget.transactions = data.transactions;
+    STATE.finances.budget.projection = data.projection || [];
+    saveState();
+    renderFinances();
+    showToast('📥 Données chargées depuis Drive');
+  }
+}
+
+// ── AUTO SYNC (après chaque saisie) ───────────────────
+function scheduleDriveSync() {
+  if (!gToken) return;
+  clearTimeout(syncTimeout);
+  syncTimeout = setTimeout(() => pushToDrive(false), 2000);
+}
+
+// ── TRANSACTIONS ───────────────────────────────────────
+const CATEGORIES = {
+  depense: ['Courses','Restaurants','Transport','Shopping','Sorties','Selfcare','Cadeaux','Imprévus','Loyer','Électricité','Téléphone','Spotify','Claude Pro','Salle de sport','Autre'],
+  revenu:  ['Aide famille','CEJ','Moakosso','IB Design','Cachet','Autre revenu']
+};
+
+function openAddTransaction(defaultType = 'depense') {
+  const modal = document.getElementById('transactionModal');
+  if (modal) {
+    document.getElementById('txType').value = defaultType;
+    updateTxCategories();
+    document.getElementById('txDate').value = new Date().toISOString().split('T')[0];
+    document.getElementById('txAmount').value = '';
+    document.getElementById('txDesc').value = '';
+    modal.style.display = 'flex';
+    document.getElementById('txAmount').focus();
+  }
+}
+
+function closeAddTransaction() {
+  const modal = document.getElementById('transactionModal');
+  if (modal) modal.style.display = 'none';
+}
+
+function updateTxCategories() {
+  const type = document.getElementById('txType').value;
+  const sel = document.getElementById('txCat');
+  sel.innerHTML = CATEGORIES[type].map(c => `<option value="${c}">${c}</option>`).join('');
+}
+
+function saveTransaction() {
+  const type = document.getElementById('txType').value;
+  const cat  = document.getElementById('txCat').value;
+  const amt  = parseFloat(document.getElementById('txAmount').value);
+  const desc = document.getElementById('txDesc').value.trim();
+  const date = document.getElementById('txDate').value;
+  if (!amt || amt <= 0) { showToast('⚠️ Montant invalide'); return; }
+  if (!date) { showToast('⚠️ Date manquante'); return; }
+  if (!STATE.finances.budget.transactions) STATE.finances.budget.transactions = [];
+  const tx = { id: Date.now(), type, cat, amount: amt, desc, date, month: date.slice(0,7) };
+  STATE.finances.budget.transactions.push(tx);
+  // Also update réel in budget rows
+  const monthKey = date.slice(0,7);
+  if (!STATE.finances.budget.reel) STATE.finances.budget.reel = {};
+  if (!STATE.finances.budget.reel[monthKey]) STATE.finances.budget.reel[monthKey] = {};
+  const section = type === 'revenu' ? 'revenus' : (isChargeFixe(cat) ? 'charges' : 'depenses');
+  if (!STATE.finances.budget.reel[monthKey][section]) STATE.finances.budget.reel[monthKey][section] = {};
+  const prev = STATE.finances.budget.reel[monthKey][section][cat] || 0;
+  STATE.finances.budget.reel[monthKey][section][cat] = prev + amt;
+  saveState();
+  scheduleDriveSync();
+  closeAddTransaction();
+  renderFinances();
+  showToast(`✅ ${type === 'revenu' ? 'Revenu' : 'Dépense'} de ${amt} € ajouté${type === 'revenu' ? '' : 'e'}`);
+}
+
+function isChargeFixe(cat) {
+  return ['Loyer','Électricité','Téléphone','Spotify','Claude Pro','Salle de sport'].includes(cat);
+}
+
+// ── PROJECTION ─────────────────────────────────────────
+function saveProjection() {
+  const month = STATE.finances.budget.viewMonth || currentMonth();
+  if (!STATE.finances.budget.projection) STATE.finances.budget.projection = [];
+  // Read from projection inputs
+  const items = [];
+  document.querySelectorAll('.proj-item').forEach(row => {
+    const type = row.querySelector('.proj-type')?.value;
+    const label = row.querySelector('.proj-label')?.value;
+    const amt = parseFloat(row.querySelector('.proj-amount')?.value) || 0;
+    const proba = row.querySelector('.proj-proba')?.value;
+    if (label && amt) items.push({ type, label, amount: amt, proba, month });
+  });
+  // Remove old projection for this month
+  STATE.finances.budget.projection = (STATE.finances.budget.projection || []).filter(p => p.month !== month);
+  STATE.finances.budget.projection.push(...items);
+  saveState();
+  scheduleDriveSync();
+  showToast('📊 Projection sauvegardée');
+  renderProjectionSummary();
+}
+
+function renderProjectionSummary() {
+  const month = STATE.finances.budget.viewMonth || currentMonth();
+  const proj = (STATE.finances.budget.projection || []).filter(p => p.month === month);
+  const revCertain = proj.filter(p => p.type === 'revenu' && p.proba === 'certain').reduce((s,p) => s + p.amount, 0);
+  const revProb = proj.filter(p => p.type === 'revenu' && p.proba === 'probable').reduce((s,p) => s + p.amount, 0);
+  const charges = proj.filter(p => p.type === 'charge').reduce((s,p) => s + p.amount, 0);
+  const el = document.getElementById('projSummary');
+  if (!el) return;
+  const solde = revCertain + revProb - charges;
+  el.innerHTML = `
+    <div class="proj-sum-row"><span>💚 Revenus certains</span><span>${revCertain} €</span></div>
+    <div class="proj-sum-row"><span>🟡 Revenus probables</span><span>+${revProb} €</span></div>
+    <div class="proj-sum-row"><span>🔴 Charges prévues</span><span>-${charges} €</span></div>
+    <div class="proj-sum-row proj-sum-total" style="border-top:1px solid var(--line);margin-top:8px;padding-top:8px;">
+      <span>⚖️ Solde projeté</span>
+      <span style="color:${solde >= 0 ? 'var(--neon-deep)' : 'var(--orange)'};font-weight:700;">${solde >= 0 ? '+' : ''}${Math.round(solde)} €</span>
+    </div>
+    <div style="margin-top:8px;text-align:center;font-size:12px;color:var(--muted);">
+      ${solde >= 0 ? '✅ Mois couvert' : '⚠️ Déficit projeté — anticipe'}
+    </div>
+  `;
+}
+
+function addProjectionRow() {
+  const container = document.getElementById('projRows');
+  const row = document.createElement('div');
+  row.className = 'proj-item';
+  row.innerHTML = `
+    <select class="proj-type fin-input-sm">
+      <option value="revenu">💚 Revenu</option>
+      <option value="charge">🔴 Charge</option>
+    </select>
+    <input class="proj-label fin-input" type="text" placeholder="Description..." />
+    <input class="proj-amount fin-input-sm" type="number" placeholder="0 €" step="0.01" />
+    <select class="proj-proba fin-input-sm">
+      <option value="certain">Certain</option>
+      <option value="probable">Probable</option>
+      <option value="incertain">Incertain</option>
+    </select>
+    <button class="proj-remove" onclick="this.parentNode.remove()">×</button>
+  `;
+  container.appendChild(row);
+}
+
+function loadProjectionRows() {
+  const month = STATE.finances.budget.viewMonth || currentMonth();
+  const proj = (STATE.finances.budget.projection || []).filter(p => p.month === month);
+  const container = document.getElementById('projRows');
+  if (!container) return;
+  container.innerHTML = '';
+  proj.forEach(p => {
+    const row = document.createElement('div');
+    row.className = 'proj-item';
+    row.innerHTML = `
+      <select class="proj-type fin-input-sm">
+        <option value="revenu" ${p.type === 'revenu' ? 'selected' : ''}>💚 Revenu</option>
+        <option value="charge" ${p.type === 'charge' ? 'selected' : ''}>🔴 Charge</option>
+      </select>
+      <input class="proj-label fin-input" type="text" value="${esc(p.label)}" placeholder="Description..." />
+      <input class="proj-amount fin-input-sm" type="number" value="${p.amount}" step="0.01" />
+      <select class="proj-proba fin-input-sm">
+        <option value="certain" ${p.proba === 'certain' ? 'selected' : ''}>Certain</option>
+        <option value="probable" ${p.proba === 'probable' ? 'selected' : ''}>Probable</option>
+        <option value="incertain" ${p.proba === 'incertain' ? 'selected' : ''}>Incertain</option>
+      </select>
+      <button class="proj-remove" onclick="this.parentNode.remove()">×</button>
+    `;
+    container.appendChild(row);
+  });
+  if (!proj.length) addProjectionRow();
+  renderProjectionSummary();
+}
+
+// ── RECENT TRANSACTIONS LIST ───────────────────────────
+function renderRecentTransactions() {
+  const month = STATE.finances.budget.viewMonth || currentMonth();
+  const txs = (STATE.finances.budget.transactions || [])
+    .filter(t => t.month === month)
+    .sort((a,b) => b.date.localeCompare(a.date))
+    .slice(0, 20);
+  const el = document.getElementById('recentTxList');
+  if (!el) return;
+  if (!txs.length) {
+    el.innerHTML = '<div style="padding:16px;text-align:center;color:var(--muted);font-style:italic;font-size:13px;">Aucune transaction ce mois-ci.</div>';
+    return;
+  }
+  el.innerHTML = txs.map((t,i) => `
+    <div class="tx-row">
+      <div class="tx-icon">${t.type === 'revenu' ? '💚' : '🔴'}</div>
+      <div class="tx-info">
+        <div class="tx-cat">${esc(t.cat)}</div>
+        <div class="tx-desc">${esc(t.desc || t.date)}</div>
+      </div>
+      <div class="tx-amount ${t.type === 'revenu' ? 'tx-pos' : 'tx-neg'}">${t.type === 'revenu' ? '+' : '-'}${t.amount} €</div>
+      <button class="tx-del" onclick="deleteTx(${t.id})">×</button>
+    </div>
+  `).join('');
+}
+
+function deleteTx(id) {
+  if (!confirm('Supprimer cette transaction ?')) return;
+  // Remove from transactions
+  const tx = STATE.finances.budget.transactions.find(t => t.id === id);
+  STATE.finances.budget.transactions = STATE.finances.budget.transactions.filter(t => t.id !== id);
+  // Remove from reel
+  if (tx && STATE.finances.budget.reel?.[tx.month]) {
+    const section = tx.type === 'revenu' ? 'revenus' : (isChargeFixe(tx.cat) ? 'charges' : 'depenses');
+    if (STATE.finances.budget.reel[tx.month][section]?.[tx.cat] !== undefined) {
+      STATE.finances.budget.reel[tx.month][section][tx.cat] -= tx.amount;
+    }
+  }
+  saveState();
+  scheduleDriveSync();
+  renderFinances();
+  showToast('Transaction supprimée');
+}
+
+// ── INIT ───────────────────────────────────────────────
+window.addEventListener('load', () => {
+  if (!STATE.finances.budget.transactions) STATE.finances.budget.transactions = [];
+  if (!STATE.finances.budget.projection)   STATE.finances.budget.projection = [];
+  initGoogleAuth();
+  setTimeout(loadProjectionRows, 500);
+  setTimeout(renderRecentTransactions, 500);
+});
+</script>
+
+<!-- ── STYLES FINANCES DRIVE ─────────────────────────── -->
+<style>
+/* Transaction modal */
+#transactionModal {
+  display: none; position: fixed; inset: 0; z-index: 1000;
+  background: rgba(26,22,18,0.6); backdrop-filter: blur(4px);
+  align-items: flex-end; justify-content: center;
+}
+.tx-modal-inner {
+  background: var(--card); border-radius: 24px 24px 0 0;
+  padding: 24px 20px 40px; width: 100%; max-width: 480px;
+  box-shadow: 0 -8px 40px rgba(26,22,18,0.15);
+}
+.tx-modal-title {
+  font-family: Fraunces, serif; font-size: 20px; font-weight: 700;
+  margin-bottom: 20px; color: var(--ink);
+}
+.fin-input {
+  width: 100%; background: var(--paper-deep); border: none; border-radius: 10px;
+  padding: 12px 14px; font-size: 15px; font-family: 'Inter Tight', sans-serif;
+  color: var(--ink); margin-bottom: 10px;
+}
+.fin-input-sm {
+  background: var(--paper-deep); border: none; border-radius: 10px;
+  padding: 10px 12px; font-size: 13px; font-family: 'Inter Tight', sans-serif;
+  color: var(--ink);
+}
+.fin-input-row { display: flex; gap: 8px; margin-bottom: 10px; }
+.fin-btn-primary {
+  width: 100%; background: var(--neon); color: var(--neon-deep); border: none;
+  border-radius: 14px; padding: 16px; font-size: 16px; font-weight: 700;
+  font-family: 'Inter Tight', sans-serif; cursor: pointer; margin-top: 8px;
+}
+.fin-btn-secondary {
+  width: 100%; background: var(--paper-deep); color: var(--muted); border: none;
+  border-radius: 14px; padding: 14px; font-size: 14px; font-weight: 600;
+  font-family: 'Inter Tight', sans-serif; cursor: pointer; margin-top: 6px;
+}
+
+/* Drive connection bar */
+.gdrive-bar {
+  display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+  background: var(--paper-deep); border-radius: 14px; margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.gdrive-status { font-size: 12px; color: var(--muted); flex: 1; }
+.gdrive-btn {
+  display: flex; align-items: center; gap: 6px; padding: 8px 14px;
+  border-radius: 10px; border: none; font-size: 12px; font-weight: 700;
+  font-family: 'Inter Tight', sans-serif; cursor: pointer;
+}
+.gdrive-btn-connect { background: var(--neon); color: var(--neon-deep); }
+.gdrive-btn-disconnect { background: var(--orange-soft); color: var(--orange-deep); display: none; }
+.gdrive-sync-btn { background: var(--blue-soft); color: var(--blue-deep); }
+.gdrive-last-sync { font-size: 10px; color: var(--muted); width: 100%; text-align: right; }
+
+/* Add transaction FAB */
+.fin-fab-row {
+  display: flex; gap: 10px; margin-bottom: 20px;
+}
+.fin-fab {
+  flex: 1; display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 16px; border-radius: 16px; border: none; font-size: 15px; font-weight: 700;
+  font-family: 'Inter Tight', sans-serif; cursor: pointer;
+}
+.fin-fab-dep { background: var(--orange-soft); color: var(--orange-deep); }
+.fin-fab-rev { background: var(--neon-soft); color: var(--neon-deep); }
+
+/* Transaction list */
+.tx-row {
+  display: flex; align-items: center; gap: 10px; padding: 12px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.tx-icon { font-size: 20px; flex-shrink: 0; }
+.tx-info { flex: 1; min-width: 0; }
+.tx-cat { font-size: 13px; font-weight: 600; color: var(--ink); }
+.tx-desc { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tx-amount { font-size: 15px; font-weight: 700; flex-shrink: 0; }
+.tx-pos { color: var(--neon-deep); }
+.tx-neg { color: var(--orange); }
+.tx-del {
+  background: none; border: none; color: var(--muted); font-size: 18px;
+  cursor: pointer; padding: 4px 6px; flex-shrink: 0;
+}
+
+/* Projection */
+.proj-item {
+  display: flex; gap: 6px; align-items: center; margin-bottom: 8px; flex-wrap: wrap;
+}
+.proj-remove {
+  background: none; border: none; color: var(--muted); font-size: 20px;
+  cursor: pointer; padding: 0 4px;
+}
+.proj-sum-row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 0; font-size: 14px; color: var(--ink);
+}
+.fin-section-title {
+  font-family: Fraunces, serif; font-size: 16px; font-weight: 700;
+  color: var(--ink); margin: 20px 0 12px;
+}
+.fin-add-proj-btn {
+  background: var(--paper-deep); border: none; border-radius: 10px;
+  padding: 10px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+  color: var(--muted); margin-bottom: 12px; display: block; width: 100%;
+  font-family: 'Inter Tight', sans-serif;
+}
+.fin-save-proj-btn {
+  background: var(--neon); color: var(--neon-deep); border: none;
+  border-radius: 14px; padding: 14px 24px; font-size: 15px; font-weight: 700;
+  font-family: 'Inter Tight', sans-serif; cursor: pointer; width: 100%; margin-top: 8px;
+}
+.proj-summary-box {
+  background: var(--paper-deep); border-radius: 14px; padding: 16px;
+  margin-bottom: 20px;
+}
+</style>
+
+<!-- ── TRANSACTION MODAL ─────────────────────────────── -->
+<div id="transactionModal" onclick="if(event.target===this)closeAddTransaction()">
+  <div class="tx-modal-inner">
+    <div class="tx-modal-title">Nouvelle transaction</div>
+    <div class="fin-input-row">
+      <select id="txType" class="fin-input-sm" onchange="updateTxCategories()" style="flex:1">
+        <option value="depense">🔴 Dépense</option>
+        <option value="revenu">💚 Revenu</option>
+      </select>
+      <input id="txDate" type="date" class="fin-input-sm" style="flex:1" />
+    </div>
+    <select id="txCat" class="fin-input"></select>
+    <input id="txAmount" type="number" class="fin-input" placeholder="Montant (€)" step="0.01" min="0" inputmode="decimal" />
+    <input id="txDesc" type="text" class="fin-input" placeholder="Description (optionnel)" />
+    <button class="fin-btn-primary" onclick="saveTransaction()">✓ Enregistrer</button>
+    <button class="fin-btn-secondary" onclick="closeAddTransaction()">Annuler</button>
+  </div>
+</div>
+
+<script>
+// ── INJECT DRIVE UI INTO FINANCES PAGE ────────────────
+(function injectFinanceUI() {
+  const finView = document.getElementById('view-finances');
+  if (!finView) return;
+
+  // Find the header div and inject after it
+  const header = finView.querySelector('.tab-header');
+  if (!header) return;
+
+  const driveBar = document.createElement('div');
+  driveBar.style.padding = '0 20px';
+  driveBar.innerHTML = `
+    <!-- Google Drive bar -->
+    <div class="gdrive-bar">
+      <span id="gdriveStatus" class="gdrive-status">⚫ Non connecté</span>
+      <button id="gdriveBtnConnect" class="gdrive-btn gdrive-btn-connect" onclick="connectGoogle()">
+        🔗 Connecter Drive
+      </button>
+      <button id="gdriveBtnDisconnect" class="gdrive-btn gdrive-btn-disconnect" onclick="disconnectGoogle()">
+        Déconnecter
+      </button>
+      <button class="gdrive-btn gdrive-sync-btn" onclick="pushToDrive(true)">
+        ↑ Sync manuel
+      </button>
+      <div id="gdriveLastSync" class="gdrive-last-sync"></div>
+    </div>
+
+    <!-- FAB dépense / revenu -->
+    <div class="fin-fab-row">
+      <button class="fin-fab fin-fab-dep" onclick="openAddTransaction('depense')">
+        🔴 + Dépense
+      </button>
+      <button class="fin-fab fin-fab-rev" onclick="openAddTransaction('revenu')">
+        💚 + Revenu
+      </button>
+    </div>
+
+    <!-- Transactions récentes -->
+    <div class="fin-section-title">Transactions du mois</div>
+    <div id="recentTxList"></div>
+
+    <!-- Projection -->
+    <div class="fin-section-title">Projection du mois</div>
+    <div class="proj-summary-box" id="projSummary"></div>
+    <div id="projRows"></div>
+    <button class="fin-add-proj-btn" onclick="addProjectionRow()">+ Ajouter une ligne</button>
+    <button class="fin-save-proj-btn" onclick="saveProjection()">💾 Sauvegarder la projection</button>
+  `;
+  header.after(driveBar);
+  // Re-render after injection
+  setTimeout(() => { loadProjectionRows(); renderRecentTransactions(); }, 100);
+})();
+</script>
 </body>
 </html>
